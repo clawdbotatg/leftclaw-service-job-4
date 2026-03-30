@@ -41,7 +41,7 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
     // ── Constants ──────────────────────────────────────────────────────
     address public constant WETH = 0x4200000000000000000000000000000000000006;
     address public constant SWAP_ROUTER_02 = 0x2626664c2603336E57B271c5C0b26F421741e481;
-    address public constant UNIVERSAL_ROUTER = 0x6ff5693b99212da76ad316178a184ab56d299b43;
+    address public constant UNIVERSAL_ROUTER = 0x6fF5693b99212Da76ad316178A184AB56D299b43;
     address public constant PERMIT2 = 0x000000000022D473030F116dDEE9F6B43aC78BA3;
 
     // ── State ──────────────────────────────────────────────────────────
@@ -121,7 +121,7 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
         uint256 tokenBalBefore = IERC20(token).balanceOf(address(this));
 
         if (routeType == 0) {
-            _swapV3(path, amountETH, amountOutMin);
+            _swapV3(token, path, amountETH, amountOutMin);
         } else if (routeType == 1) {
             _swapV4(token, path, amountETH, amountOutMin);
         } else {
@@ -136,12 +136,24 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
         emit BuyExecuted(msg.sender, token, amountETH, received, routeType);
     }
 
+    // ── V3 path validation ───────────────────────────────────────────
+    function _validateV3Path(bytes calldata path, address token) internal pure {
+        require(path.length >= 43, "path too short");
+        address firstToken = address(bytes20(path[:20]));
+        require(firstToken == WETH, "path must start with WETH");
+        address lastToken = address(bytes20(path[path.length - 20:]));
+        require(lastToken == token, "path must end with target token");
+    }
+
     // ── V3 swap via SwapRouter02 ───────────────────────────────────────
     function _swapV3(
+        address token,
         bytes calldata path,
         uint256 amountIn,
         uint256 amountOutMin
     ) internal {
+        _validateV3Path(path, token);
+
         ISwapRouter02(SWAP_ROUTER_02).exactInput(
             ISwapRouter02.ExactInputParams({
                 path: path,
@@ -159,7 +171,7 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
         uint256 amountIn,
         uint256 amountOutMin
     ) internal {
-        // Decode V4 pool key from path
+        // Decode V4 pool key and swap params from path
         (
             address currency0,
             address currency1,
@@ -170,49 +182,29 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
             bytes memory hookData
         ) = abi.decode(path, (address, address, uint24, int24, address, bool, bytes));
 
+        // Issue #2: Validate output token matches the target token
+        address outputToken = zeroForOne ? currency1 : currency0;
+        require(outputToken == token, "output token mismatch");
+
         // Build Universal Router commands for V4_SWAP
         // Command 0x10 = V4_SWAP
         bytes memory commands = hex"10";
 
-        // Build the V4 swap actions
-        // SWAP_EXACT_IN_SINGLE = 0x06
-        // SETTLE_ALL = 0x0c  (pay input)
-        // TAKE_ALL = 0x0f    (receive output)
+        // Issue #1 & #3: Properly encode V4SwapData as a single bytes input
+        // V4_SWAP command takes: abi.encode(poolKey, zeroForOne, exactAmount, minAmountOut, hookData)
+        // Issue #3: Use sqrtPriceLimitX96 = 0 (no price limit) instead of hardcoded magic values
+        bytes memory poolKey = abi.encode(currency0, currency1, fee, tickSpacing, hooks);
 
-        bytes memory actions = abi.encodePacked(
-            bytes1(0x06), // SWAP_EXACT_IN_SINGLE
-            bytes1(0x0c), // SETTLE_ALL
-            bytes1(0x0f)  // TAKE_ALL
-        );
-
-        // Encode params for SWAP_EXACT_IN_SINGLE
-        bytes[] memory v4Params = new bytes[](3);
-
-        // SWAP_EXACT_IN_SINGLE params
-        v4Params[0] = abi.encode(
-            // PoolKey struct
-            currency0,
-            currency1,
-            fee,
-            tickSpacing,
-            hooks,
-            // swap params
+        bytes memory v4SwapData = abi.encode(
+            poolKey,
             zeroForOne,
-            uint128(amountIn),
-            uint160(zeroForOne ? 4295128740 : 1461446703485210103287273052203988822378723970341), // sqrtPriceLimitX96 (MIN+1 or MAX-1)
+            uint256(amountIn),
+            uint256(amountOutMin),
             hookData
         );
 
-        // SETTLE_ALL params: (currency, maxAmount)
-        address inputCurrency = zeroForOne ? currency0 : currency1;
-        v4Params[1] = abi.encode(inputCurrency, uint128(amountIn));
-
-        // TAKE_ALL params: (currency, minAmount)
-        address outputCurrency = zeroForOne ? currency1 : currency0;
-        v4Params[2] = abi.encode(outputCurrency, uint128(amountOutMin));
-
         bytes[] memory inputs = new bytes[](1);
-        inputs[0] = abi.encode(actions, v4Params);
+        inputs[0] = v4SwapData;
 
         IUniversalRouter(UNIVERSAL_ROUTER).execute(
             commands,
