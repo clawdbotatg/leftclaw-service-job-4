@@ -20,6 +20,7 @@ import {
 } from "./treasury";
 import { discoverBestRoute } from "./route-discovery";
 import { executeTokenBuy } from "./tx-executor";
+import { V4PoolIndexer } from "./v4-pool-indexer";
 
 dotenv.config();
 
@@ -51,7 +52,8 @@ async function processBuyRequest(
   buyRequest: BuyRequest,
   config: AgentConfig,
   provider: ethers.Provider,
-  contract: ethers.Contract
+  contract: ethers.Contract,
+  poolIndexer: V4PoolIndexer
 ): Promise<void> {
   const { token, amountETH, maxSlippageBps } = buyRequest;
 
@@ -61,6 +63,9 @@ async function processBuyRequest(
   console.log(`  Token: ${token}`);
   console.log(`  Amount: ${ethers.formatEther(amountETH)} ETH`);
   console.log(`  Max slippage: ${maxSlippageBps.toString()} bps`);
+  if (buyRequest.poolId) {
+    console.log(`  Forced poolId: ${buyRequest.poolId}`);
+  }
   console.log(`  Block: ${buyRequest.blockNumber} | TX: ${buyRequest.transactionHash}`);
 
   // Safety check: max ETH per swap
@@ -91,12 +96,14 @@ async function processBuyRequest(
       ? maxSlippageBps
       : BigInt(config.minSlippageBps);
 
-  // Discover best route
+  // Discover best route (pass poolIndexer + optional forced poolId)
   const route = await discoverBestRoute(
     provider,
     token,
     amountETH,
-    effectiveSlippage
+    effectiveSlippage,
+    poolIndexer,
+    buyRequest.poolId
   );
 
   if (!route) {
@@ -134,7 +141,7 @@ async function main(): Promise<void> {
   console.log(`[agent] Max swap: ${config.maxSwapETH} ETH`);
   console.log(`[agent] Poll interval: ${config.pollIntervalMs}ms`);
 
-  // Set up provider and wallet
+  // Set up provider, wallet, and V4 pool indexer
   const provider = new ethers.JsonRpcProvider(config.rpcUrl);
 
   // Verify chain ID
@@ -179,6 +186,13 @@ async function main(): Promise<void> {
     console.log(`[agent] ✓ Worker wallet is authorized as bot`);
   }
 
+  // Initialize V4 pool indexer (SQLite-backed, incremental refresh every 30s)
+  const poolIndexer = new V4PoolIndexer(provider);
+  console.log(`[agent] Building V4 pool index from PoolManager.Initialize events...`);
+  await poolIndexer.buildIndex();
+  console.log(`[agent] ✓ V4 pool index ready (${poolIndexer.getPoolCount()} pools)`);
+  poolIndexer.startAutoRefresh(30000);
+
   // Start polling
   let lastProcessedBlock = (await provider.getBlockNumber()) - 1;
   console.log(
@@ -217,7 +231,7 @@ async function main(): Promise<void> {
           }
 
           processedEvents.add(eventId);
-          await processBuyRequest(request, config, provider, contract);
+          await processBuyRequest(request, config, provider, contract, poolIndexer);
         }
 
         lastProcessedBlock = toBlock;

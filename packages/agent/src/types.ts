@@ -21,6 +21,8 @@ export interface BuyRequest {
   blockNumber: number;
   transactionHash: string;
   logIndex: number;
+  /** Optional forced V4 poolId — if set, agent MUST use only this pool (no fallback) */
+  poolId?: string;
 }
 
 /** A V3 route candidate */

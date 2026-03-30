@@ -8,18 +8,84 @@
 
 ---
 
-## What Was Built
+## Client V4 Spec Fixes (Issues 1-3)
 
-A **TypeScript/Node.js backend agent** that executes token purchases through Uniswap V3 and V4 routes, driven by `TreasuryManager` contract events on Base (chain 8453).
+### Issue 1 [CRITICAL] — ETH Handling is Route-Dependent ✅
 
-### Architecture
+**Problem:** The contract unconditionally wrapped ALL ETH → WETH before any swap, including V4 swaps. V4 Universal Router handles native ETH natively — wrapping was incorrect for V4 routes.
+
+**Fix (TreasuryManager.sol):**
+- `routeType == 0 (V3)`: Wrap ETH → WETH, approve, swap via WETH (unchanged)
+- `routeType == 1 (V4)`: **No wrapping.** Forward native ETH as `msg.value` directly to the Universal Router via `execute{value: amountIn}(...)`
+
+```solidity
+if (routeType == 0) {
+    // V3: Wrap ETH → WETH, approve, swap via WETH
+    IWETH(WETH).deposit{value: amountETH}();
+    _swapV3(token, path, amountETH, amountOutMin);
+} else if (routeType == 1) {
+    // V4: Forward native ETH as msg.value — no wrapping
+    _swapV4(token, path, amountETH, amountOutMin);
+}
+```
+
+The `_swapV4` function now calls:
+```solidity
+IUniversalRouter(UNIVERSAL_ROUTER).execute{value: amountIn}(commands, inputs, deadline);
+```
+
+### Issue 2 [CRITICAL] — V4 Pool Discovery Uses address(0) for ETH ✅
+
+**Problem:** The spec didn't describe how `route-discovery.ts` finds V4 pools, and V4 ETH pools use `currency0 = address(0)` — NOT the WETH address. The previous code used WETH for V4 pool lookups.
+
+**Fix (new file: `v4-pool-indexer.ts` + updated `route-discovery.ts`):**
+
+1. **SQLite-backed pool index** (`v4-pool-indexer.ts`):
+   - Indexes `PoolManager.Initialize` events into a local SQLite database
+   - Built at agent startup by scanning historical events
+   - Incremental refresh every 30 seconds — no ad-hoc chain scans at request time
+   - Indexed by `currency0`, `currency1`, and `pool_id` for fast lookups
+
+2. **V4 pool discovery** now searches for:
+   - ETH pools: `currency0 = address(0)` paired with the target token
+   - WETH pools: `currency0 = WETH` paired with the target token (some V4 pools may use WETH)
+   - Both are checked for liveness via `StateView.getSlot0` before quoting
+
+3. **V4 path encoding** always uses `address(0)` as `currency0` for ETH pairs — never WETH.
+
+### Issue 3 — Forced Pool ID Behavior ✅
+
+**Problem:** If the operator provides a V4 `poolId`, the agent should use ONLY that pool with no silent fallback to other pools or routing methods.
+
+**Fix:**
+
+1. **Contract** (`TreasuryManager.sol`):
+   - `BuyRequest` event now includes `bytes32 poolId`
+   - New `requestBuyWithPool(token, amountETH, maxSlippageBps, poolId)` function for forcing a specific pool
+   - Original `requestBuy()` emits `poolId = bytes32(0)` (no forced pool)
+
+2. **Agent** (`route-discovery.ts` + `treasury.ts`):
+   - `BuyRequest` type includes optional `poolId` field
+   - If `poolId` is present and non-zero: agent looks up the pool in the SQLite index
+   - If pool is NOT found in the index → **fail immediately** with clear error message
+   - If pool is found but not live (sqrtPriceX96 = 0) → **fail immediately**
+   - **No silent fallback** to other pools or routing methods
+   - If `poolId` is not set: normal V3+V4 discovery proceeds as before
+
+---
+
+## Architecture
 
 ```
 Agent (Node.js/TypeScript + ethers.js v6)
   ├── Event Monitor — polls TreasuryManager for BuyRequest events
+  ├── V4 Pool Indexer (SQLite)
+  │     ├── Startup: scans PoolManager.Initialize events historically
+  │     └── Auto-refresh: incremental every 30s (no ad-hoc scans)
   ├── Route Discovery Engine
-  │     ├── V3: 4 direct fee tiers + 4 multi-hop via USDC
-  │     └── V4: Single-hop pool discovery via StateView
+  │     ├── V3: 4 direct fee tiers + 4 multi-hop via USDC (uses WETH)
+  │     ├── V4: Pool lookup from SQLite index (uses address(0) for ETH)
+  │     └── Forced poolId: fail-fast, no fallback
   ├── Quoter Layer (with retry + rate-limit handling)
   │     ├── V3 QuoterV2 — quoteExactInput
   │     └── V4 Quoter — quoteExactInputSingle
@@ -36,23 +102,24 @@ packages/
 ├── agent/
 │   ├── src/
 │   │   ├── index.ts              # Main loop (polls BuyRequest events)
-│   │   ├── treasury.ts           # TreasuryManager interaction
+│   │   ├── treasury.ts           # TreasuryManager interaction (with poolId)
 │   │   ├── quoter.ts             # V3 QuoterV2 + V4 Quoter (with retries)
 │   │   ├── path-encoder.ts       # V3 packed + V4 ABI encoding
-│   │   ├── route-discovery.ts    # Candidate generation + best-route selection
+│   │   ├── route-discovery.ts    # Candidate generation + forced poolId + best-route selection
+│   │   ├── v4-pool-indexer.ts    # NEW: SQLite-backed V4 pool index
 │   │   ├── tx-executor.ts        # Wallet signing + broadcast
 │   │   └── types.ts              # Shared types + Base contract addresses
 │   ├── test/
-│   │   ├── path-encoder.test.ts  # 13 unit tests
-│   │   ├── route-discovery.test.ts # 4 unit tests
-│   │   └── integration.test.ts   # 4 integration tests (live Base RPC)
+│   │   ├── path-encoder.test.ts  # Unit tests
+│   │   ├── route-discovery.test.ts # Unit tests
+│   │   └── integration.test.ts   # Integration tests (live Base RPC)
 │   ├── package.json
 │   ├── tsconfig.json
 │   ├── vitest.config.ts
 │   └── .env.example
 └── foundry/
     └── contracts/
-        └── TreasuryManager.sol   # Reference contract implementation
+        └── TreasuryManager.sol   # Updated: route-dependent ETH handling + poolId
 ```
 
 ---
@@ -61,16 +128,17 @@ packages/
 
 | Decision | Implementation |
 |---|---|
-| **Routing** | Typed routing — `uint8 routeType` (0=V3, 1=V4) |
+| **ETH Handling** | Route-dependent: V3 wraps ETH→WETH; V4 forwards native ETH as msg.value |
+| **V4 currency0** | `address(0)` for ETH pairs (never WETH in V4 context) |
+| **V4 Pool Index** | SQLite via better-sqlite3; built at startup, refreshed every 30s |
+| **Pool Discovery** | From local SQLite index — never ad-hoc chain scans at request time |
+| **Forced poolId** | Fail fast if unresolved; no silent fallback |
 | **V3 routes** | Direct at 4 fee tiers (100, 500, 3000, 10000) + multi-hop via USDC |
-| **V4 routes** | Single-hop only; pool discovery via StateView.getSlot0 |
+| **V4 routes** | Single-hop; pools from SQLite index, verified live via StateView |
 | **V4 payload** | `abi.encode(currency0, currency1, fee, tickSpacing, hooks, zeroForOne, hookData)` |
-| **Quoting** | eth_call with retry logic (3 attempts, 500ms backoff) and concurrency control |
-| **Path encoding** | V3: packed bytes; V4: ABI-encoded pool key + swap params |
+| **Quoting** | eth_call with retry logic (3 attempts, 500ms backoff) |
 | **Best route** | Highest `amountOut` across all quoted candidates |
 | **Slippage** | `amountOutMin = amountOut * (10000 - maxSlippageBps) / 10000` |
-| **Token destination** | Stays in TreasuryManager contract |
-| **ETH handling** | Contract wraps ETH → WETH; routes always start from WETH |
 
 ---
 
@@ -85,83 +153,6 @@ packages/
 | SwapRouter02 | `0x2626664c2603336E57B271c5C0b26F421741e481` | ✅ |
 | Universal Router | `0x6fF5693b99212Da76ad316178A184AB56D299b43` | ✅ |
 | WETH | `0x4200000000000000000000000000000000000006` | ✅ |
-
-**Note:** The V3 QuoterV2 address from the original spec (`0x3d4e44Eb1374240CE5F1B136064a6Dbc1C84C58c`) had no deployed code on Base. The correct address was sourced from the official [Uniswap V3 Base deployments docs](https://docs.uniswap.org/contracts/v3/reference/deployments/base-deployments).
-
----
-
-## Test Results
-
-### Unit Tests (17 passing)
-
-**Path Encoder (13 tests):**
-- V3 single-hop encoding
-- V3 multi-hop encoding
-- V3 encode/decode roundtrip
-- V3 all fee tiers
-- V3 edge cases (insufficient tokens, mismatched fees)
-- V4 encode/decode with zero hookData
-- V4 encode/decode with custom hookData
-- Address sorting (currency0 < currency1)
-- Route path encoding (V3 + V4)
-
-**Route Discovery (4 tests):**
-- Direct routes at all fee tiers
-- Multi-hop routes via USDC
-- Correct candidate count
-- Informative descriptions
-
-### Integration Tests (4 passing — live Base RPC)
-
-| Test | Result |
-|---|---|
-| V3 WETH→USDC @ 500bps | ✅ 20.5M USDC (~$2054/ETH) |
-| V3 all fee tiers | ✅ All 4 return quotes |
-| V4 pool discovery | ✅ Found 3 V4 WETH/USDC pools |
-| Full route discovery | ✅ Best: V3 @ 100bps → 20.5M USDC |
-
-### Live Quote Results
-
-```
-V3 WETH→USDC @ 100bps:   20,524,734 USDC  ← BEST
-V3 WETH→USDC @ 500bps:   20,509,383 USDC
-V3 WETH→USDC @ 3000bps:  20,503,505 USDC
-V3 WETH→USDC @ 10000bps: 20,416,328 USDC
-V4 WETH→USDC @ 500bps:   20,036,693 USDC
-V4 WETH→USDC @ 3000bps:  20,514,086 USDC
-V4 WETH→USDC @ 10000bps: ✗ (pool uninitialized)
-```
-
----
-
-## TreasuryManager Contract
-
-A reference `TreasuryManager.sol` is included in `packages/foundry/contracts/`. Key features:
-
-- **Authorization**: Only authorized bots can call `buyTokenWithETH` and `requestBuy`
-- **V3 swaps**: Via SwapRouter02 (`exactInput`)
-- **V4 swaps**: Via UniversalRouter (V4_SWAP command with SWAP_EXACT_IN_SINGLE)
-- **Safety**: ReentrancyGuard, balance checks, owner-only admin functions
-- **Approvals**: Pre-approved WETH to SwapRouter02 + Permit2 (for Universal Router)
-
-### Contract Interface
-
-```solidity
-function buyTokenWithETH(
-    address token,        // Token to buy
-    uint256 amountETH,    // ETH to spend (wraps to WETH)
-    uint8 routeType,      // 0=V3, 1=V4
-    bytes calldata path,  // Encoded path
-    uint256 amountOutMin  // Slippage protection
-) external;
-
-event BuyRequest(
-    address indexed bot,
-    address indexed token,
-    uint256 amountETH,
-    uint256 maxSlippageBps
-);
-```
 
 ---
 
@@ -191,31 +182,14 @@ npm start
 
 ---
 
-## Phase 2 Status
-
-The agent prototype is **code-complete and tested** against live Base state:
-- ✅ V3 route discovery and quoting works on live Base
-- ✅ V4 pool discovery and quoting works on live Base
-- ✅ Path encoding verified with roundtrip tests
-- ✅ Best route selection works correctly
-- ⏳ Live swap execution requires a deployed TreasuryManager contract with ETH funding
-
-### To complete Phase 2:
-1. Deploy `TreasuryManager.sol` to Base
-2. Fund the TreasuryManager with ETH
-3. Authorize the worker wallet as a bot
-4. Emit a `BuyRequest` event
-5. Run the agent — it will discover the best route and execute the swap
-
----
-
 ## Security Notes
 
 - ✅ No private keys committed to git
 - ✅ `.env` excluded via `.gitignore`
-- ✅ `.env.example` with placeholder values only
+- ✅ SQLite database (`v4-pools.db`) excluded via `.gitignore`
 - ✅ Slippage protection enforced (configurable minimum)
 - ✅ Max swap amount configurable (default 1 ETH)
 - ✅ Chain ID verification (rejects wrong chain)
 - ✅ Bot authorization check before operation
 - ✅ Treasury balance check before swap attempt
+- ✅ Forced poolId fails fast — no silent fallback

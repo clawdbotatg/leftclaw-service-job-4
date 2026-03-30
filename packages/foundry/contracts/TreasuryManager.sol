@@ -52,7 +52,8 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
         address indexed bot,
         address indexed token,
         uint256 amountETH,
-        uint256 maxSlippageBps
+        uint256 maxSlippageBps,
+        bytes32 poolId
     );
 
     event BuyExecuted(
@@ -101,7 +102,19 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
     ) external onlyBot {
         if (amountETH == 0) revert ZeroAmount();
         if (address(this).balance < amountETH) revert InsufficientBalance();
-        emit BuyRequest(msg.sender, token, amountETH, maxSlippageBps);
+        emit BuyRequest(msg.sender, token, amountETH, maxSlippageBps, bytes32(0));
+    }
+
+    /// @notice Request a buy with a forced V4 poolId (agent must use only this pool, no fallback)
+    function requestBuyWithPool(
+        address token,
+        uint256 amountETH,
+        uint256 maxSlippageBps,
+        bytes32 poolId
+    ) external onlyBot {
+        if (amountETH == 0) revert ZeroAmount();
+        if (address(this).balance < amountETH) revert InsufficientBalance();
+        emit BuyRequest(msg.sender, token, amountETH, maxSlippageBps, poolId);
     }
 
     // ── Execute a buy (called by authorized bot / agent wallet) ───────
@@ -115,14 +128,14 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
         if (amountETH == 0) revert ZeroAmount();
         if (address(this).balance < amountETH) revert InsufficientBalance();
 
-        // Wrap ETH → WETH
-        IWETH(WETH).deposit{value: amountETH}();
-
         uint256 tokenBalBefore = IERC20(token).balanceOf(address(this));
 
         if (routeType == 0) {
+            // V3: Wrap ETH → WETH, approve, swap via WETH
+            IWETH(WETH).deposit{value: amountETH}();
             _swapV3(token, path, amountETH, amountOutMin);
         } else if (routeType == 1) {
+            // V4: Forward native ETH as msg.value — no wrapping
             _swapV4(token, path, amountETH, amountOutMin);
         } else {
             revert InvalidRouteType();
@@ -206,7 +219,8 @@ contract TreasuryManager is Ownable, ReentrancyGuard {
         bytes[] memory inputs = new bytes[](1);
         inputs[0] = v4SwapData;
 
-        IUniversalRouter(UNIVERSAL_ROUTER).execute(
+        // Forward native ETH as msg.value — Universal Router handles it natively for V4
+        IUniversalRouter(UNIVERSAL_ROUTER).execute{value: amountIn}(
             commands,
             inputs,
             block.timestamp + 300

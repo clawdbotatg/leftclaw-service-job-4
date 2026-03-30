@@ -144,6 +144,7 @@ export function encodeRoutePath(route: RouteCandidate): string {
 
 /**
  * Sort two addresses for V4 pool key (currency0 < currency1).
+ * address(0) always sorts first (represents native ETH in V4).
  */
 export function sortAddresses(
   a: string,

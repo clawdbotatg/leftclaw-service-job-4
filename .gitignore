@@ -20,6 +20,12 @@ out/
 # TypeScript
 *.tsbuildinfo
 
+# SQLite pool index
+*.db
+*.db-journal
+*.db-wal
+*.db-shm
+
 # OS
 .DS_Store
 Thumbs.db

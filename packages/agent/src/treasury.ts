@@ -9,13 +9,14 @@ import { BuyRequest } from "./types";
 /** Minimal ABI for the TreasuryManager contract */
 export const TREASURY_MANAGER_ABI = [
   // Events
-  "event BuyRequest(address indexed bot, address indexed token, uint256 amountETH, uint256 maxSlippageBps)",
+  "event BuyRequest(address indexed bot, address indexed token, uint256 amountETH, uint256 maxSlippageBps, bytes32 poolId)",
   "event BuyExecuted(address indexed bot, address indexed token, uint256 amountETHSpent, uint256 amountTokenReceived, uint8 routeType)",
   "event BotAuthorized(address indexed bot, bool authorized)",
 
   // Functions
   "function buyTokenWithETH(address token, uint256 amountETH, uint8 routeType, bytes calldata path, uint256 amountOutMin) external",
   "function requestBuy(address token, uint256 amountETH, uint256 maxSlippageBps) external",
+  "function requestBuyWithPool(address token, uint256 amountETH, uint256 maxSlippageBps, bytes32 poolId) external",
   "function setBot(address bot, bool authorized) external",
   "function authorizedBots(address) external view returns (bool)",
   "function owner() external view returns (address)",
@@ -44,8 +45,15 @@ export async function getBuyRequests(
   const filter = contract.filters.BuyRequest();
   const events = await contract.queryFilter(filter, fromBlock, toBlock);
 
+  const ZERO_BYTES32 = "0x" + "0".repeat(64);
+
   return events.map((event) => {
     const log = event as ethers.EventLog;
+    const rawPoolId = log.args[4] as string;
+    // If poolId is zero bytes32, treat as no forced pool
+    const poolId =
+      rawPoolId && rawPoolId !== ZERO_BYTES32 ? rawPoolId : undefined;
+
     return {
       bot: log.args[0] as string,
       token: log.args[1] as string,
@@ -54,6 +62,7 @@ export async function getBuyRequests(
       blockNumber: log.blockNumber,
       transactionHash: log.transactionHash,
       logIndex: log.index,
+      poolId,
     };
   });
 }
